@@ -1,17 +1,15 @@
 import pandas as pd
 import numpy as np 
 import numpy_financial as npf
-from functools import reduce
 
 from .financial_utils import _series_to_array, _find_series_index
-from .financial_graphs import _create_plotly_table
 
 class PmeMetrics:
     """
     Compute and hold KSPME and Direct Alpha metrics
 
     Has functions to rescale cashflows 
-
+    
     Parameters to instantiate
     ----------
     contributions : array_like, ideally pd.Series
@@ -24,13 +22,21 @@ class PmeMetrics:
         Series containing index fund values over time (e.g., CAC40).
     discount_rate : float, optional, default: 0.1
         The discount rate used in calculations.
+    periods: int, optional, by default 4
+        The periods used to annualize IRR, by default data is assumed to be quarterly
+        
+    Notes
+    -------
+    For increased comparability, make sure to select an index with reinvested dividends
     """
 
-    def __init__(self, contributions: pd.Series, 
-               distributions: pd.Series, 
-               net_asset_value: pd.Series, 
-               index_fund: pd.Series, 
-               discount_rate: float=0.1) -> None:
+    def __init__(self, contributions : pd.Series, 
+                distributions : pd.Series, 
+                net_asset_value : pd.Series, 
+                index_fund : pd.Series, 
+                daily_data: pd.Series=None,
+                discount_rate: float=0.,
+                periods: int=4) -> None:
         """
         Initialize an instance of the PmeMetrics class.
 
@@ -49,18 +55,23 @@ class PmeMetrics:
 
         self.contributions = _series_to_array(contributions)
         self.distributions = _series_to_array(distributions)
+        self.daily_data = _series_to_array(daily_data)
         self.net_cashflows = self.distributions - self.contributions
         self.discount_rate = discount_rate
         
-        #Index fund as in CAC40, not dataframe index
-        self.index_fund = _series_to_array(index_fund)  
+        #Index fund as in CAC40, not dataframe index. Rescaled so the first period t = 1 is 1 and then each 
+        #subsequent period is expressed as a ratio of the evolution in value
+        index_fund = _series_to_array(index_fund)  
+        self.index_fund = index_fund / index_fund[0]
+
         #Keeps in memory the original data index if at least one argument has an index, else takes a default index 
         self.time_index = _find_series_index(contributions, distributions, index_fund) 
         #* (1 - discount_rate)
         self.net_asset_value = _series_to_array(net_asset_value) 
+        self.periods = periods
 
     #PME functions
-    def future_value_calculator(self, cashflow: np.ndarray) -> np.ndarray:
+    def _future_value_calculator(self, cashflows : np.ndarray, daily_data: np.ndarray = None) -> np.ndarray:
         """
         Calculates the future value of cashflows if those cashflows were invested in a public index. 
         
@@ -81,57 +92,177 @@ class PmeMetrics:
         ValueError
             If len(cashflow) =/= len(index)
         """
+                
+        if daily_data is None: 
+            if not (len(cashflows) == len(self.index_fund)):
+                raise ValueError("cashflows and index must be the same length")
+            index_T = self.index_fund[-1] #the index's value at the last period T
+        else:
+            pass
+            #daily_data = _series_to_array(daily_data)
+            #index_T = np.mean(daily_data[-30:]) #the monthly mean in the last period 
+        
+        rescaled_cashflows = cashflows * (index_T / self.index_fund)
 
-        if not (len(cashflow) == len(self.index_fund)):
-            raise ValueError("cashflow and index must be the same length")
-
-        index_T = self.index_fund[-1] #the index's value at the last period T
-
-        IT_vec = np.ones(len(self.index_fund)) * index_T
-
-        return cashflow * (IT_vec / self.index_fund)
+        return rescaled_cashflows
     
-    def future_value_adjuster(self) -> np.ndarray:
+    def _value_adjuster(self, distributions : np.ndarray, contributions : np.ndarray) -> tuple[np.ndarray]:
         """
         Convenience function to correct the initial calculation of the FVC and FVD by adding the last value of the last_net_asset_value
 
+        Parameters
+        ----------
+        distributions : np.ndarray
+            A column of cash distributions
+        contributions : np.ndarray
+            A column of cash contributions
+
         Returns
         -------
-        FVD, FVC : np.ndarray
-            Two arrays, one of future distributions and one of future contributions
+        distributions, contributions : np.ndarray
+            Two arrays, one of distributions and contributions in a tuple
         """
-
-        future_value_contribution = self.future_value_calculator(self.contributions)
-        future_value_distribution = self.future_value_calculator(self.distributions)
-        future_value_distribution[-1] = future_value_distribution[-1] + self.net_asset_value[-1] * (1 - self.discount_rate)
 
         #Some contributions are negative. In this case, they are treated as as a reversion of funds and attributed to distributions
-        future_value_distribution = future_value_distribution + np.where(future_value_contribution<0, - 1 * future_value_contribution, 0) 
-        future_value_contribution = np.where(future_value_contribution<0, 0, future_value_contribution)
-
-        return future_value_distribution, future_value_contribution
+        distributions = distributions - np.where(contributions < 0, contributions, 0) 
+        contributions[contributions < 0] = 0
+        
+        return (distributions, contributions)
     
-    def compute_ks_pme(self) -> float:
+    def _nav_adjuster(self, cashflow : np.ndarray, nav_array : np.ndarray) -> np.ndarray:
         """
-        Calculates the Kaplan Schoar PME based on a passed index and the fund's cashflows
+        Adds the last period remainding NAV to the cashflows, with a potential discount
+                
+        Parameters
+        ----------
+        cashflow : np.ndarray
+            A column of cashsflows of the form distributions - contributions
+        nav_array : np.ndarray
+            An array with the NAV values
+
+        Returns
+        -------
+        cashflow : np.ndarray
+            A cashflow array with the last value updated
+        """
+
+        cashflow[-1] = cashflow[-1] + nav_array[-1] * (1 - self.discount_rate)
+
+        return cashflow
+
+    def _calculate_ln_nav(self, cashflows : np.ndarray) -> list:
+        """
+        Calculates the LN-PME NAV. 
+
+        Requires cashflows to be of the form contributions - distributions
+
+        Parameters
+        ----------
+        cashflow : np.ndarray
+            A column of cashsflows of the form distributions - contributions
+            
+        Returns
+        -------
+        nav_list : np.list
+            A list of NAV for the synthetic benchmark fund
+        """
+        
+        index_fund_growth = self.index_fund[1:] / self.index_fund[:-1]      
+
+        #Each new NAV value at t for the PME is equal to the NAV at t - 1 times the change in the 
+        #index + (-) the contributions (the distributions)
+
+        periods = len(cashflows) - 1
+        nav_list = [cashflows[0]]
+        for i in range(periods):
+            new_nav_val = nav_list[-1] * index_fund_growth[i] + cashflows[i + 1]
+            nav_list.append(new_nav_val)
+
+        return nav_list
+
+    def compute_ks_pme(self, 
+                       return_details: bool=False) -> float:
+        """
+        Calculates the Kaplan Schoar PME based on a passed index and the fund's cashflows*
+        
+        The formula is KSPME = FutureValuesDistributions / FutureValuesContributions
+        
+        Parameters
+        ----------
+        return_details : np.bool
+            Whether to return the cumulated cashflows instead.
+        
+        Notes
+        ----------
+        With the cumulated cashflows, each value for t is equal to the sum of the capitalized cashflows
+        So the ratio of the last cumulated capitalized distribution and contribution is the overall KS PME
+            
+        Returns
+        -------
+        ks_pme : float
+            The KS-PME of the fund 
+            
+        or pd.DataFrame, the detailed cashflows, if return_details is True
+        """
+        
+        #Computing cumulative capitalized cashflows --> Upper triangular matrix of format 
+        cumulated_distributions, cumulated_contributions = self._compute_ks_pme_cashflows()
+        cumulated_distributions, cumulated_contributions = self._value_adjuster(cumulated_distributions, cumulated_contributions)
+
+        #Summing up all cashflows for each timestep t        
+        cumulated_distributions = np.sum(cumulated_distributions, axis=0)
+        cumulated_contributions = np.sum(cumulated_contributions, axis=0)
+        
+        #Adding the cashflows at T that are not capitalized to the last period
+        cumulated_distributions[-1] = cumulated_distributions[-1] + self.distributions[-1]
+        cumulated_contributions[-1] = cumulated_contributions[-1] + self.contributions[-1]
+        
+        #Adding the values at t=0
+        cumulated_distributions = np.insert(cumulated_distributions, 0, self.distributions[0])
+        cumulated_contributions = np.insert(cumulated_contributions, 0, self.contributions[0])
+
+        #Adjusting and adding NAV to follow procedure as defined in other PME methods
+        cumulated_distributions = self._nav_adjuster(cumulated_distributions, self.net_asset_value)
+
+        if (return_details is True):
+            
+            return pd.DataFrame(data = {"cumulatedDistributions": cumulated_distributions,
+                                        "cumulatedContributions": cumulated_contributions,
+                                        "ksPme": cumulated_distributions / cumulated_contributions
+                                        },
+                                index = self.time_index
+                                )
+        
+        kspme = cumulated_distributions[-1] / cumulated_contributions[-1]
+        
+        return kspme
+
+    def compute_ks_pme_old(self) -> float:
+        """
+        Calculates the Kaplan Schoar PME based on a passed index and the fund's cashflows*
+        
+        The formula is KSPME = FutureValuesDistributions / FutureValuesContributions
 
         Returns
         -------
         ks_pme : float
             The KS-PME of the fund 
-
-        Notes
-        -------
-        For increased comparability, make sure to select an index with reinvested dividends
         """
+        
+        future_value_distribution = self._future_value_calculator(self.distributions)
+        future_value_contribution = self._future_value_calculator(self.contributions)
+        future_value_distribution, future_value_contribution = self._value_adjuster(future_value_distribution, future_value_contribution)
+        future_value_distribution = self._nav_adjuster(future_value_distribution, self.net_asset_value)
 
-        future_value_distribution, future_value_contribution = self.future_value_adjuster()
-
-        return np.sum(future_value_distribution)/np.sum(future_value_contribution)
-
+        kspme = np.sum(future_value_distribution) / np.sum(future_value_contribution)
+        
+        return kspme
+    
     def compute_direct_alpha(self) -> float:
         """
         Calculates the direct alpha based on a passed index and the fund's cashflows
+        
+        The formula is Alpha = IRR(FutureValuesContributions - FutureValuesDistributions)
 
         Returns
         -------
@@ -139,239 +270,162 @@ class PmeMetrics:
             The direct alpha of the fund
         """
 
-        future_value_distribution, future_value_contribution = self.future_value_adjuster()
-        
+        future_value_distribution = self._future_value_calculator(self.distributions)
+        future_value_contribution = self._future_value_calculator(self.contributions)
+        future_value_distribution, future_value_contribution = self._value_adjuster(future_value_distribution, future_value_contribution)
+        future_value_distribution = self._nav_adjuster(future_value_distribution, self.net_asset_value)
+
         net_cashflows = future_value_distribution - future_value_contribution
+        irr = npf.irr(net_cashflows) 
 
-        return npf.irr(net_cashflows)
-
-class PmeTable(PmeMetrics):
-    """
-    Class to calculate and hold a table of PME metrics. 
-
-    Should not be instantiated directly. Instead, use class constructors from_wide_data and 
-    from_long_data.  
-    """
-    def __init__(self, table_data : np.ndarray, index_list : list, portfolio_list : list):
-
-        self.index_list = index_list
-        self.portfolio_list = portfolio_list
-        
-        self.table_data = table_data
-
-        #Here as a reminder that self.table will be filled later 
-        self.table = None 
-
-    @classmethod
-    def from_long_data(cls, 
-                        pe_fund: pd.DataFrame, 
-                        index_list: list, 
-                        portfolio_list: list, 
-                        contribution_col: str, 
-                        distribution_col: str, 
-                        fmv_col: str = "fmv", 
-                        entity_col: str = "entity", 
-                        metric: str = "kspme",
-                        discount_rate: float = 0.2) -> "PmeTable":
-        """
-        Class constructor for PmeTable
-
-        Generate a Public Market Equivalent (PME) table
-        
-        For the time being, requires a DataFrame in long format. If you have wide data, see from_wide_data
-
-        This function calculates PME values for each entity in the private equity fund using the provided DataFrame.
-
-        The PME calculation requires information on contributions, distributions, fair market values (FMV), and entities.
-
-        Parameters
-        ----------
-        pe_fund : pandas.DataFrame
-            A DataFrame in long format containing information about the private equity fund.
-        index_list : list
-            A list of public indices to help PME computations.
-        portfolio_list : list[str] or 
-            A list of portfolios to compute PME for. 
-        contribution_col : str
-            The column name containing contribution values.
-        distribution_col : str
-            The column name containing distribution values.
-        fmv_col : str, optional, default: "fmv"
-            The column name containing fair market values.
-        entity_col : str, optional, default: "entity"
-            The column name containing entity information.
-        discount_rate : float, optional, default: 0.2
-            The discount rate used in the PME calculation.
-
-        Returns
-        -------
-        PmeTable
-            Return an instance of PmeTable.
-        """
-
-        if isinstance(pe_fund, dict):
-            pe_fund = pd.concat(pe_fund, axis=0)
-        elif not isinstance(pe_fund, pd.DataFrame):
-            raise TypeError("Input data must be dict of DataFrames or DataFrame") 
-
-        if entity_col not in pe_fund.columns.tolist():
-            raise ValueError("You must provide a column from the dataframe from which to subset funds")
-
-        #Creates the receiving array
-        res = np.zeros((len(index_list), len(portfolio_list), 2))
-
-        #Check all possible combination of funds and public indexes and recalculate PME for them
-        for ind_col, portfolio_iteration in enumerate(portfolio_list): 
-
-            for ind_row, index_iteration in enumerate(index_list):
-
-                full_fund_df = pe_fund.loc[lambda x : (x[entity_col] == portfolio_iteration) & (x[index_iteration] != 0)]
-                
-                pme = PmeMetrics(full_fund_df[contribution_col], full_fund_df[distribution_col], full_fund_df[fmv_col], full_fund_df[index_iteration], discount_rate=discount_rate)
-
-                res[ind_row, ind_col, :] = [pme.compute_direct_alpha(), pme.compute_ks_pme()]
-
-        #Instantiate a PmeTable
-        pme_table = PmeTable(res, index_list, portfolio_list)
-
-        pme_table.table = pme_table.create_plotly_table(res, metric = metric)
-
-        return pme_table
+        return (1 + irr) ** (self.periods) - 1
     
-    @classmethod
-    def from_wide_data(cls, 
-                       pe_fund: pd.DataFrame,  
-                       index_list: list, 
-                       date: str, 
-                       contribution_suffix: str, 
-                       distribution_suffix: str, 
-                       fmv_suffix: str, 
-                       portfolio_list : list = None,
-                       metric : str = "kspme",
-                       discount_rate: float = 0.2) -> "PmeTable":
+    def compute_ln_pme(self) -> float:
         """
-        Class constructor for PmeTable
-
-        Generate a Public Market Equivalent (PME) table.
+        Computes the Long Nickels PME metric
         
-        Only works with wide data. Requires a specific structure where each column is a combination
-        of suffix or prefix and a fund name e.g. fmv_AIFII, contributions_AIFII etc.
-
-        We need this structure to be able to regroup columns by type (Fmv, distribution, etc.) and add a column to identify funds
-
-        Reshapes the data in a long format and then calls from_long_data
-
-        This function calculates PME values for each entity in the private equity fund using the provided DataFrame.
-
-        The PME calculation requires information on contributions, distributions, fair market values (FMV).
-
-        Parameters
-        ----------
-        pe_fund : pandas.DataFrame
-            A DataFrame in wide format containing information about the private equity fund.
-        index_list : list
-            A list of public indices to help PME computations.
-        date: str
-            The name of a date column
-        contribution_suffix : str
-            The identifier of contribution columns, e.g. "contribution_"
-        distribution_suffix : str
-            The identifier of distribution columns, e.g. "distribution_"
-        fmv_suffix : str
-            The identifier of fmv columns, e.g. "fmv_"
-        portfolio_list : list, optional, by default None
-            The list of portfolios on which to compute statistics 
-            If portfolio_list ==  None, will return for all funds present in the DataFrame
-        metric : str, optional, default: "kspme"
-            The metric to produce, 
-        discount_rate : float, optional, default: 0.2
-            The discount rate used in the PME calculation.
+        All cashflows are the same until period T. At period T, the cashflow 
+        is summed with a rescaled NAV_T.
+        
+        The NAV is built iteratively for period t based on values at t - 1 with 
+        the formula NAV_t = NAV_t-1 * (Index_t / Index_t-1) + contribution_t - distributions_t 
 
         Returns
         -------
-        PmeTable
-            Return an instance of PmeTable.
-
+        float
+            The LN PME metric expressed in % 
         """
-        #Concatenate along the x axis
-        if isinstance(pe_fund, dict):
-            pe_fund = pd.concat(pe_fund, axis=1)
-        elif not isinstance(pe_fund, pd.DataFrame):
-            raise TypeError("Input data must be dict of DataFrames or DataFrame") 
 
-        if date not in pe_fund.columns.tolist():
-            raise ValueError("You must provide a column from the dataframe to use as date")
+        distributions, contributions = self._value_adjuster(self.distributions, self.contributions)
+        net_cashflows = distributions - contributions
 
-        suffixes = (contribution_suffix, distribution_suffix, fmv_suffix)
+        #Only difference between pme_cashflows & pe_cashflow is the last NAV value
+        #Add the last value of the PME NAV to the last cashflow
 
-        #Reshaping from wide to long by type of columns
-        full_long_df = []
-        for suffix in suffixes:
+        pme_cashflows = -1 * net_cashflows.copy() #We change sign so that contributions are positive and distributions negative
+        nav_list = self._calculate_ln_nav(pme_cashflows)
+
+        pme_cashflows = net_cashflows.copy()
+        pme_cashflows = self._nav_adjuster(pme_cashflows, nav_list)
+
+        #Add the last value of the PE NAV to the last cashflow
+        private_cashflows = net_cashflows.copy()
+        private_cashflows = self._nav_adjuster(private_cashflows, self.net_asset_value)
+
+        irr_pe = npf.irr(private_cashflows)
+        irr_pe = (1 + irr_pe) ** self.periods - 1
+        irr_pme = npf.irr(pme_cashflows)
+        irr_pme = (1 + irr_pme) ** self.periods - 1
+
+        return irr_pe - irr_pme
+    
+    def compute_mpme(self, 
+                     return_details: bool=False) -> float:
+        """
+        Computes Cambridge's mPME metric
+
+        Parameters
+        ----------
+        return_details : bool, optional
+            Whether to return the rescaled cashflows or the PME metric, by default False
+            If false, return the mPME metric
+
+        Returns
+        -------
+        float
+            The mPME metric
+        """
+        
+        distributions, contributions = self._value_adjuster(self.distributions, self.contributions)
+        distribution_weights = distributions / (distributions + self.net_asset_value)
+        index_fund_growth = self.index_fund[1:] / self.index_fund[:-1]      
+        
+        periods = len(distribution_weights)
+        nav_list = [contributions[0] - distributions[0]]
+        distribution_list = [distributions[0]]
+        
+        for i in range(1, periods): #We need to rebuild the NAV iteratively
             
-            #Filtering on what columns will be reshaped in long format. For each iteration, columns of the same group (e.g. FMV) are reshaped together
-            cols = pe_fund.filter(like=suffix, axis=1).columns.to_list()
-            long_df = pd.melt(pe_fund, id_vars=[date], value_vars=cols, var_name='entity', value_name=suffix)
-
-            #Cleaning the newly created entity column to remove the suffix
-            long_df["entity"] = long_df["entity"].str.replace(suffix, "")
-            full_long_df.append(long_df)
+            value_creation = (nav_list[-1] * index_fund_growth[i - 1] + contributions[i])
         
-        #Recursive merging of the dataframes
-        full_long_df = reduce(lambda left, right : pd.merge(left, right, on=[date, "entity"], how='outer'), full_long_df)
+            new_nav_val = value_creation * (1 - distribution_weights[i])        
+            nav_list.append(new_nav_val)
+            
+            weighted_distribution = value_creation * distribution_weights[i]
+            distribution_list.append(weighted_distribution)
 
-        #We recreated a long df from the wide df 
-        if portfolio_list is None: 
-            portfolio_list = list(full_long_df["entity"].unique())
-
-        #Fusing back the public indexes using many to one relationship to multiply the public indexes 
-        full_long_df = (full_long_df.merge(pe_fund.loc[:, index_list + [date]], on = date, how = "left")
-                                    .sort_values(["entity", "quarterDate"])
-                                    .dropna())
+        if (return_details is True):
+            return pd.DataFrame(data = {"weightedDistributions": distribution_list,
+                                        "distributions": distributions,
+                                        "contributions": contributions,
+                                        },
+                                index = self.time_index
+                                )
+            
+        net_cashflows_pme = np.asarray(distribution_list) - contributions
+        pme_cashflows = self._nav_adjuster(net_cashflows_pme, nav_list)
+        irr_pme = npf.irr(pme_cashflows)
+        irr_pme = (1 + irr_pme) ** self.periods - 1
         
-        #Then calling the long format method 
-        return cls.from_long_data(full_long_df, 
-                                  ndex_list, 
-                                  portfolio_list, 
-                                  contribution_suffix, 
-                                  distribution_suffix, 
-                                  fmv_suffix, 
-                                  entity_col = 'entity', 
-                                  discount_rate=0, 
-                                  metric = metric)
+        net_cashflows = distributions - contributions
+        private_cashflows = self._nav_adjuster(net_cashflows, self.net_asset_value)
+        irr_pe = npf.irr(private_cashflows)
+        irr_pe = (1 + irr_pe) ** self.periods - 1
+        
+        return irr_pe - irr_pme
+    
+    def _compute_ks_pme_cashflows(self,) -> tuple:
+            """
+            Computes a view of cumulated capitalized cashflows for a fund
+            
+            The cumulative cashflows are calculated as the sum of the capitalized cashflows for each time step t
+            
 
-
-    def create_plotly_table(self, data: np.ndarray, metric: str = "kspme"):
+            Returns
+            -------
+            pd.DataFrame
+                A dataframe with 2 columns: 
+            """
+            
+            index_fund_growth = self.index_fund[1:] / self.index_fund[:-1] #length is T - 1, we are missing t=0
+            n_steps = len(index_fund_growth)
+            #Since np.tri(n_steps).T is an upper triangular matrix filled with 1s and 0s otherwise, the product with the broadcast
+            #is index_fund_growth in a n * n format but only the upper triangular part
+            cumprod_matrix = ((index_fund_growth[None,:] + np.zeros(shape=(n_steps, n_steps), dtype=np.int8)) 
+                              * np.tri(N=n_steps, dtype=np.int8).T
+                              )           
+            #Creates a square matrix that we will fill iteratively so that cashflows are only taken into account
+            #once we reach the diagnonal value. Since the matrix is filled with 0, summing all rows means each cashflow gradual 
+            #capitalization is only counted once the diagonal is passed going rightward
+            cumprod_matrix[cumprod_matrix == 0] = 1 #NOTE find a better way
+            cumprod_matrix = np.cumprod(cumprod_matrix, axis=1)
+            cumprod_matrix =  np.triu(cumprod_matrix) #Keep only the upper triangle
+            
+            #Broadcasting values over the cumprod matrix. 
+            cumulated_distributions = self.distributions[:-1,None] * cumprod_matrix 
+            cumulated_contributions = self.contributions[:-1,None] * cumprod_matrix
+            
+            return (cumulated_distributions, cumulated_contributions)
+                
+    def compute_market_performances(self) -> tuple[float, float]:
         """
-        Creates a plotly table of PE fund's Public Market Equivalent
+        Use the fund performance and the PME to calculate the corresponding benchmark performance
 
-        Parameters
-        ----------
-        data : dict
-            A dictionnary of np.arrays with metrics as keys. Each array must have as values the Public Market Equivalent for a combination of PE fund and public index
-        index : list
-            Axis 0 of the table
-        columns : list
-            Axis 1 of the table 
-        metric : str, optional
-            The metric in the table, by default "kspme"
-            Can be one of ('direct_alpha', 'kspme')
-
-        Returns
-        -------
-        go.Figure
-            A plotly table of Public Market Equivalent performances 
-        """
-        #TODO Consider expanding to more metrics 
-
-        #Set for the color_maker. ALSO used as a way to choose the metric since they are stored in axis 2 at values 0 and 1
-        threshold = 1
-        if metric == "direct_alpha":
-            threshold = 0
-
-        #Since the data are stored in a 3D array, retrieves the right metric along the z axis
-        data = data[:,:,threshold]
-
-        columns, index = self.index_list, self.portfolio_list
+        Roughly removing market perf from fund perf gives the PME
+        Removing the PME from the fund perf gives the market perf
         
-        return _create_plotly_table(data, columns, index, threshold = threshold, metric=metric)
+        """
+        distributions, contributions = self._value_adjuster(self.distributions, self.contributions)
+        distributions = self._nav_adjuster(distributions, self.net_asset_value)
+
+        #DIRECT ALPHA
+        irr_base = (1 + npf.irr(distributions - contributions)) ** self.periods - 1
+        market_irr = irr_base - self.direct_alpha()
+
+        #KSPME
+        tvpi = distributions / contributions
+        market_multiple = tvpi / self.compute_ks_pme()
+
+        return (market_irr, market_multiple)
+
 

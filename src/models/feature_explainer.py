@@ -15,6 +15,7 @@ class FeatureExplainer():
         self.features = features
         self.coefs = coefs
 
+
         self.permut_coefs = None
         self.fig = None
 
@@ -34,15 +35,18 @@ class FeatureExplainer():
             _description_
         """
         
-        features = model[:-2].get_feature_names_out()
+        try:
+            features = model[:-1].get_feature_names_out()
+        except:
+            features = None
 
-        if hasattr(model[-1], "feature_importances_"):
+        if hasattr(model, "coef_"):
         
-            coefs = model[-1].feature_importances_
-            coef_df = pd.DataFrame(np.vstack((features, coefs)).T, columns = ["features", "coefs"])
-            coef_df = coef_df.astype({"coefs": float, "features": str}).sort_values("coefs", ascending=False)
-            features = coef_df["features"].to_numpy()
-            coefs = coef_df["coefs"].to_numpy()
+            coefs = model.coef_
+            #coef_df = pd.DataFrame(np.vstack((features, coefs)).T, columns = ["features", "coefs"])
+            #coef_df = coef_df.astype({"coefs": float, "features": str}).sort_values("coefs", ascending=False)
+            #features = coef_df["features"].to_numpy()
+            #coefs = coef_df["coefs"].to_numpy()
 
         else: 
             coefs = None
@@ -57,8 +61,8 @@ class FeatureExplainer():
         features, coefs = cls.check_has_importance(model)
         fe = FeatureExplainer(model, features, coefs)
 
-        fig = fe.plot_top_features(fe.coefs)
         if is_show:
+            fig = fe.plot_top_features(fe.coefs)
             fig.show()
 
         return fe 
@@ -70,7 +74,8 @@ class FeatureExplainer():
                    model_params : dict = None, 
                    test_split: float = 0.3, 
                    is_show: bool = False) -> "FeatureExplainer":
-        """_summary_
+        """
+        _summary_
 
         Parameters
         ----------
@@ -92,29 +97,37 @@ class FeatureExplainer():
         """
         
         X, y = data
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_split, random_state=1830, stratify=y)
+        X, y = _series_to_array(X), _series_to_array(y)
+
+        assert len(X) == len(y)
+
+        split_index = int(len(X) * test_split)
+        X_train, y_train = X[:split_index], y[:split_index]
 
         if model_params is None: 
-            model_trained = model().fit(X_train, y_train)
+            model_trained = model()
         else:
-            model_trained = model(**model_params).fit(X_train, y_train)
+            model_trained = model(**model_params)
+        model_trained.fit(X_train, y_train)
 
         fe = cls.from_model(model_trained)
 
-        fig = fe.plot_top_features(fe.coefs)
         if is_show:
+            fig = fe.plot_top_features(fe.coefs)
             fig.show()
 
         return fe 
     
     def compute_permutation(self, 
                             data: tuple, 
-                            n_repeat: int = 5, 
+                            n_repeat: int = 10, 
                             is_show: bool = False,
-                            threshold: float = 0.5,
+                            test_split: float = 0.3,
+                            #threshold: float = 0.5,
                             n_cols : int = None,
                             score_func = accuracy_score) -> tuple[np.ndarray]:
-        """_summary_
+        """
+        Compute the feature importance for each col
 
         Parameters
         ----------
@@ -137,16 +150,23 @@ class FeatureExplainer():
             _description_
         """
         
-        X_test, y_test = data
-        
-        features = X_test.columns.to_list() 
+        X, y = data
+        features = X.columns.to_list() 
+
+        if isinstance(y, (np.ndarray, list)):
+            y = pd.Series(y)
         if n_cols is not None: 
             features = features[:n_cols]
+
+        split_index = int(len(X) * test_split)
+        X_test, y_test = X.iloc[split_index:], y.iloc[split_index:]
 
         #y_pred_proba = self.model.predict_proba(X_test)[:,1]
         #y_pred = np.where(y_pred_proba>=threshold, 1, 0)
 
-        y_pred_proba = self.model.predict_proba(shuffled_df)
+        X_test = _series_to_array(X_test)
+
+        y_pred_proba = self.model.predict_proba(X_test)
         y_pred = np.argmax(y_pred_proba, axis = 1)
 
         score = score_func(y_test, y_pred)
@@ -165,7 +185,8 @@ class FeatureExplainer():
 
             for _ in range(n_repeat):
 
-                shuffled_df[feature] = shuffled_df[feature].sample(frac=1, replace = False).to_numpy()
+                np.random.default_rng().shuffle(shuffled_df[:,i])
+
                 y_pred_proba = self.model.predict_proba(shuffled_df)
                 y_pred = np.argmax(y_pred_proba, axis = 1)
 
@@ -181,14 +202,15 @@ class FeatureExplainer():
 
         res_final = score - res_features_cv 
 
-        self.fig = self.plot_top_columns(features, res_final)
         if is_show:
+            self.plot_top_columns(features, res_final)
             self.fig.show()
 
         self.permut_coefs = res_final
         self.cols = features
+        self.results = pd.DataFrame({"features" : features, "diff_score" : res_final})
 
-        return (features, res_final)
+        return self
 
 
     def plot_top_features(self, coefs):
@@ -200,12 +222,13 @@ class FeatureExplainer():
     def plot_top_columns(self, cols, coefs):
 
         self.fig = feature_cols_plotting(cols, coefs)
-        return self.fig
+
+        return self
 
 
 def feature_importance_plotting(features: np.ndarray) -> go.Scatter:
     """
-    _summary_
+    Plot the feature importance for each feature
 
     Parameters
     ----------
@@ -227,7 +250,7 @@ def feature_importance_plotting(features: np.ndarray) -> go.Scatter:
 
 def feature_cols_plotting(features: np.ndarray, coefs_permut : np.ndarray) -> go.Scatter:
     """
-    _summary_
+    Plot the column importance for each feature 
 
     Parameters
     ----------
@@ -245,3 +268,22 @@ def feature_cols_plotting(features: np.ndarray, coefs_permut : np.ndarray) -> go
                       xaxis_title="Columns",
                       yaxis_title="Feature Importance")
     return fig
+
+def _series_to_array(obj) -> np.ndarray:
+    """
+    Converts an array like object into an array 
+
+    Parameters
+    ----------
+    obj:
+      Any array_like object
+    
+    Returns
+    -------
+    np.ndarray
+    """
+    if isinstance(obj, (pd.Series, pd.DataFrame)): 
+      return obj.to_numpy()
+    elif isinstance(obj, list):
+      return np.array(obj)
+    return obj

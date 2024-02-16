@@ -1,7 +1,6 @@
 import pandas as pd
 import numpy as np
 import numpy_financial as npf   
-from copy import deepcopy
 
 from .financial_graphs import _liner_plot
 from .financial_utils import _find_series_index, _series_to_array
@@ -16,11 +15,7 @@ class FinancialReport:
   Has functions for TVPI, MOIC and IRR 
   """
 
-  def __init__(self, contributions: pd.Series, 
-               distributions: pd.Series, 
-               net_asset_value: pd.Series, 
-               discount_rate:float = 0.1, 
-               periods: int=4) -> None:
+  def __init__(self, contributions: pd.Series, distributions: pd.Series, net_asset_value: pd.Series, discount_rate:float = 0.1, periods: int=4) -> None:
     """
     Initialize an instance of the FinancialReport class.
 
@@ -55,25 +50,25 @@ class FinancialReport:
     self.time_index = _find_series_index(contributions, distributions) 
     self.net_asset_value = _series_to_array(net_asset_value) 
     
-  def compute_all_ratios(self) -> pd.DataFrame:
+  def compute_all_ratios(self) -> dict:
     """
-    Computes all ratio methods and store them in a pd.DataFrame
+    Computes all ratio methods and store them in a dictionnary
 
     Returns
     -------
-    value_dict :  pd.DataFrame
-        A DataFrame of metrics ratios
+    value_dict :  dict
+        A dictionnary of metrics ratios
     """
 
     self.value_dict = dict(dpi=self.compute_dpi(),
                             rvpi=self.compute_rvpi(),
                             tvpi=self.compute_tvpi(),
                             moic=self.compute_moic(),
-                            netCumCashflows=np.cumsum(self.net_cashflows),
+                            net_cashflows=np.cumsum(self.net_cashflows),
                             irr=self.compute_irr(),
                             )
         
-    return pd.DataFrame(self.value_dict)
+    return self.value_dict
 
 
   def compute_dpi(self) -> np.ndarray:
@@ -111,48 +106,24 @@ class FinancialReport:
       Returns:
       - numpy.ndarray: Array of MOIC values at each time period.
       """
-      return ((self.net_asset_value + np.cumsum(self.distributions)) 
-                / np.sum(self.contributions)
-                )
+      return (
+          (self.net_asset_value  + np.cumsum(self.distributions)) 
+          / np.sum(self.contributions)
+          )
   
   def compute_irr(self) -> float:
     """
-    Compute the Internal Rate of Return (IRR) for the cashflows and NAV.
+    Compute the Internal Rate of Return (IRR) for the cashflows.
 
     Returns:
     - float: The computed IRR.
 
     """
-    #IRR at year 0 is 0 and we then append computed results
-    irr_list = [0]
-    n_steps = len(self.net_cashflows)
-    
-    if n_steps == 1:
-       return np.asarray(irr_list)
-    
-    else:
-        #2 potential options to calculate IRR: adding the NAV to the last value or not
-        #For the time being, we use the NAV to be coherent with the previous works we did. 
-        #But this strongly inflates early IRR values
+    irr_array =  np.asarray([npf.irr(self.net_cashflows[:i]) for i in range(1, self.net_cashflows.shape[0])])
+    return (1+ irr_array) ** self.periods - 1
 
-        #Option 1 with the NAV:
-        for i in range(1, n_steps): 
-            #We use i + 1 since slices are exclusive for the upper bound
-            rescaled_cashflows = deepcopy(self.net_cashflows[:i+1])
-            rescaled_cashflows[i] += self.net_asset_value[i]
-            irr_list.append(npf.irr(rescaled_cashflows))
-        
-        #Option 2 without the NAV:
-        #irr_list = irr_list + [npf.irr(self.net_cashflows[:i+1]) for i in range(1, n_steps)]
-    
-    irr_array =  np.asarray(irr_list)
 
-    return (1 + irr_array) ** self.periods - 1
-
-  def plot(self, 
-           data, 
-           title: str = None, 
-           name: str = None):
+  def plot(self, data, title: str=None, name: str=None):
     """
     Plot the specified data using a plot. Way to integrate a plotting function into the class. 
 

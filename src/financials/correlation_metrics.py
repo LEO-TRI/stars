@@ -69,11 +69,11 @@ class RollingCorrelation(ShiftReturnsMixin):
             An instance of the class
         """
 
-        feature_series, column_names, index_names = RollingCorrelation.check_values(feature_series)
-        iterations = RollingCorrelation.check_iterations(feature_series)
+        feature_series, column_names, index_names = cls.check_values(feature_series)
+        iterations = cls.check_iterations(feature_series)
 
         if not is_return:
-            feature_series = RollingCorrelation.log_returns(feature_series)
+            feature_series = cls.log_returns(feature_series)
 
         target_series = np.array(target_series)
         res = np.empty((len(target_series), iterations)) * np.nan
@@ -172,7 +172,7 @@ class RollingCorrelation(ShiftReturnsMixin):
 
         Parameters
         ----------
-        returns : numpy.ndarray
+        returns : np.ndarray
             The input data representing returns.
 
         Returns
@@ -189,7 +189,7 @@ class RollingCorrelation(ShiftReturnsMixin):
         if len(returns.shape) == 2:
             iterations = returns.shape[1]
         elif len(returns.shape) == 1:
-            # To allow 1 iteration on dimension y
+            # To allow 1 iteration on dimension 1 if there is only a 1D array passed
             returns = returns.reshape(-1, 1)
             iterations = 1
         else:
@@ -199,13 +199,13 @@ class RollingCorrelation(ShiftReturnsMixin):
 
 
 class SignCorrelation(RollingCorrelation):
-    def __init__(self, cum_corr, column_names: list = None, index_names: list = None) -> None:
+    def __init__(self, cum_corr: np.ndarray, column_names: list = None, index_names: list = None) -> None:
         """
         Inherits shifts_return, check_values, check_iterations and plot from parent class RollingCorrelation
 
         Parameters
         ----------
-        cum_corr : numpy.ndarray
+        cum_corr : np.ndarray
             The cumulative correlation matrix.
         column_names : list, optional, default: None
             List of column names for the correlation matrix.
@@ -242,9 +242,9 @@ class SignCorrelation(RollingCorrelation):
 
         Parameters
         ----------
-        target_series : numpy.ndarray
+        target_series : np.ndarray
             The series against which all correlations will be computed.
-        feature_series : numpy.ndarray
+        feature_series : np.ndarray
             The series for which correlations with the target series will be calculated.
         is_return : bool, optional, default: False
             If True, assumes that the input series are returns, and the cumulative sum will be computed accordingly.
@@ -257,26 +257,44 @@ class SignCorrelation(RollingCorrelation):
             An instance of the SignCorrelation class representing the calculated correlations.
         """
 
-        feature_series, column_names, index_names = SignCorrelation.check_values(
-            feature_series)
-        iterations = SignCorrelation.check_iterations(feature_series)
+        #Nb of iterations is determined by number of columns in array
+        feature_series, column_names, index_names = cls.check_values(feature_series)
+        iterations = cls.check_iterations(feature_series)
 
+        #We use log returns since we only need to know when a return was negative/positive
         if not is_return:
-            feature_series = SignCorrelation.log_returns(feature_series)
+            feature_series = cls.log_returns(feature_series)
 
         # Converts the first return table into signs. It will be sliced later
         target_series = np.where(target_series < 0, -1, 1)
 
+        #We fill the empty array that will receive the results with nans. Each index 
+        #will start at a different date and therefore columns may have nans at the 
+        #beginning to show that the index has not started
+        #The size of the array is built based on the dimensions of the Ardian fund array. 
         res = np.empty((len(target_series), iterations))
         res[:] = np.nan
 
-        # Fill-in each column based on its length
+        # Fill-in each column based on its length. Since not every column has the same length
+        #we do some creative slicing first to readjust each ardian return column to be of the same
+        #length compared to the public returnb 
+
         for i in range(iterations):
-            tmp_feature = np.where(
-                feature_series[np.isfinite(feature_series[:, i]), i] < 0, -1, 1)
-            index_slice = len(target_series) - len(tmp_feature)
-            tmp_target = target_series[index_slice:]
-            res[index_slice:, i] = np.cumsum(tmp_target * tmp_feature)
+            #Creating a sliced version of the given public index i. We remove all nans from the column.
+            sliced_public_returns = feature_series[np.isfinite(feature_series[:, i]), i]
+            signed_public_returns = np.where(sliced_public_returns < 0, -1, 1)
+            
+            #Adjusting size of Ardian's returns by remove the difference in len from the beginning 
+            #of the Ardian's return.
+            #This step assumes there will not be be a public return longer than Ardians funds. 
+            index_slice = len(target_series) - len(signed_public_returns)
+            signed_ardian_returns = target_series[index_slice:]
+
+            #We have 2 1D arrays of only 1 and - 1 so product of the 2 arrays give us a new array with only 1s and -1s as well
+            sign_correlation_array = signed_ardian_returns * signed_public_returns
+
+            #Filling in those returns in the given column starting at the given year (represented by a slice)
+            res[index_slice:, i] = np.cumsum(sign_correlation_array)
 
         s_corr = cls(cum_corr=res, column_names=column_names,
                      index_names=index_names)

@@ -1,3 +1,4 @@
+import pandas as pd
 import numpy as np
 from .financial_utils import _is_numeric, _is_array_like, _series_to_array
 from .returns_mixin import ShiftReturnsMixin
@@ -32,7 +33,6 @@ class RatioMetrics(ShiftReturnsMixin):
             Array containing risk-free rates quarterly.
         periods: int
             Integer indicating how many periods of the data there is in one year e.g. for quarterly data periods=4, by default 4
-            Data are assumed to be quarterly by default
 
         Returns
         -------
@@ -44,17 +44,17 @@ class RatioMetrics(ShiftReturnsMixin):
         self.index_fund = index_fund
         self.risk_free_rate = risk_free_rate
         self.periods = periods
-
         # Placeholder that will be overwritten when calling self.compute_all_ratios
         self.value_dict = None  
 
     @classmethod
-    def from_data(cls,
-                  returns: np.ndarray,
-                  index_fund: np.ndarray = None,
-                  risk_free_rate: float = 0.0025,
-                  is_return: bool = False,
-                  periods: int = 4) -> "RatioMetrics":
+    def from_data(
+        cls,
+        returns: np.ndarray,
+        index_fund: np.ndarray = None,
+        risk_free_rate: float = 0.005,
+        is_return: bool = False,
+        periods: int = 4) -> "RatioMetrics":
         """
         A constructor to build the class.
 
@@ -66,7 +66,6 @@ class RatioMetrics(ShiftReturnsMixin):
             Array containing returns of the investment over time.
         index_fund : numpy.ndarray
             Array containing values of the index fund (e.g., CAC40) over time, by default None.
-            Required for some metrics to be computed
         is_return: bool
             Whether the index_fund variable are returns or values, by default False
         risk_free_rate : numpy.ndarray or float, optional, default: 0.005
@@ -99,14 +98,9 @@ class RatioMetrics(ShiftReturnsMixin):
         index_fund = _series_to_array(index_fund) if index_fund is not None else None
         returns = _series_to_array(returns)
 
-        #We can accept a constant risk - free rate (a scalar) or an array of varying 
-        #risk free rate (the interest on US treasuries for instance)
-        #If a scalar, we do not need to check further the risk free rate
         if _is_numeric(risk_free_rate):
             risk_free_rate = risk_free_rate
 
-        #If array like, we convert to numpy and check if it has the same length
-        #as returns
         elif _is_array_like(risk_free_rate):
             risk_free_rate = _series_to_array(risk_free_rate)
             if len(returns) != len(risk_free_rate):
@@ -116,12 +110,10 @@ class RatioMetrics(ShiftReturnsMixin):
             raise ValueError("Risk free rate must be number or array_like")
 
         if (not is_return) & (index_fund is not None):
-            #Compute returns and remove resulting nan values
-            index_fund = cls.normal_returns(index_fund)
+            index_fund = RatioMetrics.normal_returns(index_fund)
             mask = np.isfinite(index_fund)
             index_fund = index_fund[mask]
 
-            #Slice the fund returns in the same manner as for the index
             returns = returns[mask]
             if isinstance(risk_free_rate, np.ndarray):
                 risk_free_rate = risk_free_rate[mask]
@@ -139,14 +131,14 @@ class RatioMetrics(ShiftReturnsMixin):
         """
 
         self.value_dict = dict(sharpe_ratio=self.compute_sharpe_ratio(),
-                                sortino_ratio=self.compute_sortino_ratio(),
-                                )
+                          sortino_ratio=self.compute_sortino_ratio(),
+                          )
         
         # Add additional metrics that require index funds
         if self.index_fund is not None:  
-            self.value_dict.update(dict(modigliani_metric=self.compute_modigliani_metric(),
-                                        treynor_ratio=self.compute_treynor_ratio(),
-                                        jensen_alpha=self.compute_jensen_alpha(),
+            self.value_dict.update(dict(modigliani_ratio=self.compute_modigliani_ratio(),
+                                   treynor_ratio=self.compute_treynor_ratio(),
+                                   jensen_alpha=self.compute_jensen_alpha(),
                                     )
                                    )
 
@@ -170,7 +162,7 @@ class RatioMetrics(ShiftReturnsMixin):
         excess_returns = self.returns - self.risk_free_rate
         sharpe_ratio_period = np.mean(excess_returns) / np.std(excess_returns)
 
-        return sharpe_ratio_period * self.periods ** 0.5
+        return sharpe_ratio_period * (self.periods ** 0.5)
 
     def compute_fund_beta(self) -> float:
         """
@@ -189,8 +181,8 @@ class RatioMetrics(ShiftReturnsMixin):
         """
 
         covariance_beta = np.cov(self.returns, self.index_fund, rowvar=False)[1, 0]
-        
-        return covariance_beta / np.var(self.index_fund)        
+        return covariance_beta / np.var(self.index_fund)
+                
 
     def compute_treynor_ratio(self) -> float:
         """
@@ -210,7 +202,7 @@ class RatioMetrics(ShiftReturnsMixin):
         excess_returns = np.mean(self.returns) - np.mean(self.risk_free_rate)
         treynor_ratio_period = excess_returns / self.compute_fund_beta()
 
-        return treynor_ratio_period * self.periods ** 0.5
+        return treynor_ratio_period * (self.periods ** 0.5)
     
     def compute_jensen_alpha(self) -> float:
         """
@@ -231,12 +223,13 @@ class RatioMetrics(ShiftReturnsMixin):
         market_excess_returns = np.mean(self.index_fund) - np.mean(self.risk_free_rate)
         jensen_alpha_period = (np.mean(self.returns) 
                                - np.mean(self.risk_free_rate)
-                               - (self.compute_fund_beta() * market_excess_returns)
+                               - self.compute_fund_beta() * market_excess_returns
                                )
                                
-        return jensen_alpha_period * self.periods
+        #(1 + jensen_alpha_period)**self.periods - 1
+        return jensen_alpha_period * (self.periods ** 0.5)
 
-    def compute_modigliani_metric(self) -> float:
+    def compute_modigliani_ratio(self) -> float:
         """
         Calculate the Modigliani adjusted risk performance measure.
 
@@ -253,14 +246,14 @@ class RatioMetrics(ShiftReturnsMixin):
             modigliani_ratio: The calculated Modigliani ratio.
         """
 
-        benchmark_excess_return = self.index_fund - self.risk_free_rate
-        benchmark_excess_return_std = np.std(benchmark_excess_return)
+        benchmark_excess_return_std = np.std(self.index_fund - self.risk_free_rate)
         mean_risk_free = np.mean(self.risk_free_rate)
 
         return (self.compute_sharpe_ratio() 
-                 * (benchmark_excess_return_std * self.periods ** 0.5)
-                 + (mean_risk_free * self.periods)
+                 * benchmark_excess_return_std * (self.periods ** 0.5)
+                 + mean_risk_free * self.periods
                  ) 
+                
 
     def compute_downside_deviation(self) -> float:
         """
@@ -273,15 +266,13 @@ class RatioMetrics(ShiftReturnsMixin):
 
         Notes
         -----
-        - The rescaled returns are calculated by subtracting mean_risk_free from the actual returns.
-        - The downside deviation is the square root of the mean of the negative returns squared.
-        - Only the negative returns are kept for the downside deviation, but the mean is calculated using the overall number
-        of values in the array i.e. the more returns above 0, the lower downside deviation will be
+        - MAR is the mean of the risk-free rate.
+        - The rescaled returns are calculated by subtracting MAR from the actual returns.
+        - The downside deviation is the square root of the sum of squared negative rescaled returns divided by the number of returns.
         """
 
-        mean_risk_free = np.mean(self.risk_free_rate)
-        rescaled_returns = self.returns - mean_risk_free
-        #Positive returns are converted to 0  
+        mar = np.mean(self.risk_free_rate)
+        rescaled_returns = self.returns - mar
         negative_squared = np.where(rescaled_returns < 0, rescaled_returns, 0) ** 2
 
         return np.mean(negative_squared) ** 0.5
@@ -300,8 +291,7 @@ class RatioMetrics(ShiftReturnsMixin):
         - The Sortino ratio is computed as (Mean(returns) - Mean(risk_free_rate)) / Downside Deviation.
         - Downside Deviation is calculated using the compute_downside_deviation method.
         """
-        excess_mean_returns = np.mean(self.returns) - np.mean(self.risk_free_rate)
 
-        sortino_ratio_period = excess_mean_returns / self.compute_downside_deviation()
-        
-        return sortino_ratio_period * self.periods ** 0.5
+        mean_excess_returns = np.mean(self.returns) - np.mean(self.risk_free_rate)
+        sortino_ratio_period = mean_excess_returns / self.compute_downside_deviation()
+        return sortino_ratio_period * (self.periods ** 0.5)
